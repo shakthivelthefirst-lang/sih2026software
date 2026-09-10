@@ -1,0 +1,22 @@
+{
+  "version": "v20260907_152622",
+  "rows": 100000,
+  "accuracy": 0.94125,
+  "features": [
+    "project_type",
+    "land_required",
+    "affected_parcels",
+    "affected_families",
+    "legal_disputes",
+    "compensation_pending",
+    "approval_pending",
+    "documentation_pending",
+    "rehabilitation_pending",
+    "notification_pending",
+    "award_pending",
+    "possession_pending",
+    "stakeholder_responsiveness",
+    "environmental_risk",
+    "weather_risk"
+  ]
+}

@@ -1,0 +1,1 @@
+ALL DATA IN THIS FOLDER ARE SYNTHETIC, CORRELATED DEMONSTRATION DATA FOR THE SURVI SIH PROTOTYPE. They are NOT official Coimbatore land records, ownership records, cadastral boundaries, compensation records, or government project records. GIS coordinates are synthetic points inside a broad Coimbatore-area envelope. Do not present them as real government data.

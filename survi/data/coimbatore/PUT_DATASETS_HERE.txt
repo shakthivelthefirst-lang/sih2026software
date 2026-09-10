@@ -1,0 +1,1 @@
+Copy the previously generated Coimbatore synthetic datasets here. Key files: 20_ml_training_features.csv and 19_gis_parcels.geojson. Clearly label them synthetic/demo data.
