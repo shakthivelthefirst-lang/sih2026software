@@ -10,4 +10,4 @@ pydantic
 pytesseract
 Pillow
 pdf2image
-smpplib
+requests
