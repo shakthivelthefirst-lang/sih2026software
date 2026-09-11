@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
-.env
+# .env (tracked intentionally)
 node_modules/
 dist/
 models/*.joblib
