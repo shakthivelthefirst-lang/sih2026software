@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pandas
+numpy
+scikit-learn
+shap
+joblib
+pydantic
+pytesseract
+Pillow
+pdf2image
