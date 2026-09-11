@@ -13,14 +13,287 @@ def validate(record:dict,authorization:str=Header(None)):
  return validate_land_record(record)
 def _features(p):
  d={k:p.get(k,0) for k in FEATURES}; d["project_type"]=p.get("project_type") or "Road"; d["land_required"]=p.get("land_required",p.get("area",0)); return d
+def _build_base_parcel_conditions(
+    u: dict,
+    q: str = "",
+    survey_no: str = "",
+    subdivision: str = "",
+    village: str = "",
+    taluk: str = "",
+    district: str = "",
+    project_id: str = "",
+    assigned_to_me: bool = False
+):
+    conditions = ["1=1"]
+    args = []
+
+    # 1. Role-based Server-Side Boundaries
+    role = u.get("role", "")
+    user_district = u.get("district")
+    user_taluk = u.get("taluk")
+
+    if role == "district_authority":
+        dist = user_district or "Coimbatore"
+        conditions.append("LOWER(p.district) = LOWER(?)")
+        args.append(dist)
+    elif role == "field_officer":
+        tlk = user_taluk or "Sulur"
+        conditions.append("(LOWER(p.taluk) = LOWER(?) OR LOWER(p.village) = LOWER(?))")
+        args.extend([tlk, tlk])
+    elif role in ("state_authority", "authority", "admin"):
+        if district and district.strip() and district.strip().lower() not in ("all", "all districts"):
+            conditions.append("LOWER(p.district) = LOWER(?)")
+            args.append(district.strip())
+    else:
+        if user_district:
+            conditions.append("LOWER(p.district) = LOWER(?)")
+            args.append(user_district)
+
+    # 2. General text search `q`
+    if q and q.strip():
+        term = f"%{q.strip()}%"
+        conditions.append("""(
+            p.survey_no LIKE ? OR 
+            p.survey_number LIKE ? OR 
+            p.record_id LIKE ? OR 
+            CAST(p.id AS TEXT) LIKE ? OR 
+            p.owner_name LIKE ? OR 
+            p.owner_reference LIKE ? OR 
+            p.project_id LIKE ? OR 
+            p.village LIKE ? OR 
+            p.taluk LIKE ?
+        )""")
+        args.extend([term, term, term, term, term, term, term, term, term])
+
+    # 3. Parametric filters
+    if survey_no and survey_no.strip():
+        conditions.append("(p.survey_no LIKE ? OR p.survey_number LIKE ?)")
+        args.extend([f"%{survey_no.strip()}%", f"%{survey_no.strip()}%"])
+    if subdivision and subdivision.strip():
+        conditions.append("p.subdivision LIKE ?")
+        args.append(f"%{subdivision.strip()}%")
+    if village and village.strip() and village.strip().lower() not in ("all", "all villages"):
+        conditions.append("LOWER(p.village) = LOWER(?)")
+        args.append(village.strip())
+    if taluk and taluk.strip() and taluk.strip().lower() not in ("all", "all taluks") and role != "field_officer":
+        conditions.append("LOWER(p.taluk) = LOWER(?)")
+        args.append(taluk.strip())
+    if project_id and project_id.strip() and project_id.strip().lower() not in ("all", "all projects"):
+        conditions.append("LOWER(p.project_id) = LOWER(?)")
+        args.append(project_id.strip())
+
+    # Assigned to Me filter (Field Officer)
+    if assigned_to_me and u.get("email"):
+        conditions.append("fa.officer_email = ?")
+        args.append(u["email"])
+
+    return conditions, args
+
+
+def _get_parcel_stats_dict(c, base_conditions, base_args):
+    base_where_clause = " AND ".join(base_conditions)
+    stats_sql = f"""
+    SELECT 
+        COUNT(*) AS "all",
+        COUNT(*) FILTER (WHERE UPPER(p.stage) = 'ACQUIRED' OR p.is_acquired = true OR p.is_acquired = 1 OR UPPER(p.acquisition_status) = 'ACQUIRED') AS acquired,
+        COUNT(*) FILTER (WHERE (UPPER(p.stage) != 'ACQUIRED' OR p.stage IS NULL) AND (p.is_acquired = false OR p.is_acquired = 0 OR p.is_acquired IS NULL) AND (UPPER(p.acquisition_status) != 'ACQUIRED' OR p.acquisition_status IS NULL)) AS pending,
+        COUNT(*) FILTER (WHERE UPPER(COALESCE(fa.status, '')) = 'DISPUTED' OR UPPER(COALESCE(fa.status, '')) LIKE '%DISPUT%' OR p.legal_disputes > 0 OR UPPER(p.acquisition_status) LIKE '%DISPUT%') AS disputed,
+        COUNT(*) FILTER (WHERE UPPER(COALESCE(fa.status, 'PENDING')) LIKE '%PENDING%' OR fa.status IS NULL) AS verification_pending
+    FROM parcels p
+    LEFT JOIN field_assignments fa ON fa.parcel_id = p.id
+    WHERE {base_where_clause}
+    """
+    row = c.execute(stats_sql, base_args).fetchone()
+    return {
+        "all": int(row["all"] or 0) if row else 0,
+        "acquired": int(row["acquired"] or 0) if row else 0,
+        "pending": int(row["pending"] or 0) if row else 0,
+        "disputed": int(row["disputed"] or 0) if row else 0,
+        "verification_pending": int(row["verification_pending"] or 0) if row else 0
+    }
+
+
 @router.get("/")
-def list_parcels(authorization:str=Header(None),survey_no:str="",subdivision:str="",village:str="",taluk:str="",district:str="",risk_category:str="",project_id:str="",limit:int=100,offset:int=0):
- if not current_user(authorization): raise HTTPException(401,"Authentication required")
- q="SELECT * FROM parcels WHERE 1=1"; args=[]
- for col,val in [("survey_no",survey_no),("subdivision",subdivision),("village",village),("taluk",taluk),("district",district),("risk_category",risk_category),("project_id",project_id)]:
-  if val: q+=f" AND {col} LIKE ?"; args.append("%"+val+"%")
- q+=" ORDER BY id DESC LIMIT ? OFFSET ?"; args += [min(max(limit,1),1000),max(offset,0)]
- c=conn(); rows=[dict(r) for r in c.execute(q,args).fetchall()]; c.close(); return {"items":rows,"count":len(rows),"limit":limit,"offset":offset}
+def list_parcels(
+    authorization: str = Header(None),
+    q: str = "",
+    survey_no: str = "",
+    subdivision: str = "",
+    village: str = "",
+    taluk: str = "",
+    district: str = "",
+    project_id: str = "",
+    acquisition_status: str = "",
+    stage: str = "",
+    verification_status: str = "",
+    risk_level: str = "",
+    risk_category: str = "",
+    assigned_to_me: bool = False,
+    limit: int = 100,
+    offset: int = 0
+):
+    u = current_user(authorization)
+    if not u: raise HTTPException(401, "Authentication required")
+
+    base_conditions, base_args = _build_base_parcel_conditions(
+        u=u, q=q, survey_no=survey_no, subdivision=subdivision,
+        village=village, taluk=taluk, district=district, project_id=project_id,
+        assigned_to_me=assigned_to_me
+    )
+
+    filtered_conditions = list(base_conditions)
+    filtered_args = list(base_args)
+
+    # 4. Acquisition Status / Stage filter (applied to table items only)
+    acq_filter = (acquisition_status or stage).strip().upper()
+    if acq_filter and acq_filter not in ("ALL", "ALL STAGES", "ALL STATUSES"):
+        if acq_filter == "ACQUIRED":
+            filtered_conditions.append("(p.is_acquired = 1 OR p.is_acquired = true OR UPPER(p.acquisition_status) = 'ACQUIRED' OR UPPER(p.stage) = 'ACQUIRED')")
+        elif acq_filter in ("NOT ACQUIRED", "PENDING"):
+            filtered_conditions.append("((p.is_acquired = 0 OR p.is_acquired = false OR p.is_acquired IS NULL) AND (UPPER(p.stage) != 'ACQUIRED' OR p.stage IS NULL) AND (UPPER(p.acquisition_status) != 'ACQUIRED' OR p.acquisition_status IS NULL))")
+        elif acq_filter == "DISPUTED":
+            filtered_conditions.append("(p.legal_disputes > 0 OR UPPER(p.acquisition_status) LIKE '%DISPUTE%' OR UPPER(p.stage) LIKE '%DISPUTE%' OR UPPER(p.stage) LIKE '%OBJECTION%')")
+        else:
+            filtered_conditions.append("(UPPER(p.acquisition_status) LIKE ? OR UPPER(p.stage) LIKE ?)")
+            filtered_args.extend([f"%{acq_filter}%", f"%{acq_filter}%"])
+
+    # 5. Verification status filter (applied to table items only)
+    v_filter = verification_status.strip().upper()
+    if v_filter and v_filter not in ("ALL", "ALL STATUSES"):
+        if v_filter == "VERIFIED":
+            filtered_conditions.append("fa.status = 'Verified'")
+        elif v_filter in ("PENDING", "PENDING INSPECTION", "PENDING_INSPECTION", "VERIFICATION PENDING"):
+            filtered_conditions.append("(fa.status IS NULL OR fa.status = 'Pending Verification' OR fa.status = 'Pending' OR UPPER(fa.status) LIKE '%PENDING%')")
+        elif v_filter == "DISPUTED":
+            filtered_conditions.append("(fa.status = 'Disputed' OR p.legal_disputes > 0)")
+        elif v_filter == "REJECTED":
+            filtered_conditions.append("fa.status = 'Rejected'")
+        else:
+            filtered_conditions.append("UPPER(fa.status) LIKE ?")
+            filtered_args.append(f"%{v_filter}%")
+
+    # 6. Risk level / SLA risk filter (applied to table items only)
+    risk = (risk_level or risk_category).strip().upper()
+    if risk and risk not in ("ALL", "ALL RISKS"):
+        if risk in ("SLA_BREACH", "BREACHED"):
+            filtered_conditions.append("(p.delay_probability > 0.7 OR p.delay_days > 30)")
+        elif risk in ("AT_RISK", "AT RISK"):
+            filtered_conditions.append("(UPPER(p.risk_category) IN ('HIGH', 'CRITICAL') OR p.risk_score > 60)")
+        elif risk == "NORMAL":
+            filtered_conditions.append("(UPPER(p.risk_category) IN ('LOW', 'MEDIUM') OR p.risk_score <= 60)")
+        else:
+            filtered_conditions.append("UPPER(p.risk_category) = ?")
+            filtered_args.append(risk)
+
+    where_clause = " AND ".join(filtered_conditions)
+
+    sql = f"""
+    SELECT 
+        p.id AS id,
+        p.id AS parcel_id,
+        p.record_id,
+        COALESCE(p.survey_number, p.survey_no) AS survey_no,
+        COALESCE(p.survey_number, p.survey_no) AS survey_number,
+        p.subdivision,
+        COALESCE(p.locality, p.revenue_village, p.village) AS specific_area,
+        p.village,
+        p.taluk,
+        p.district,
+        p.area,
+        p.area_unit,
+        p.classification,
+        p.land_use,
+        p.project_id,
+        COALESCE(p.owner_name, p.owner_reference, 'Unknown') AS owner_name,
+        COALESCE(p.owner_reference, p.owner_name, '') AS owner_reference,
+        COALESCE(p.stage, p.acquisition_status, 'Proposal') AS stage,
+        COALESCE(p.acquisition_status, p.stage, 'Proposal') AS acquisition_status,
+        COALESCE(p.is_acquired, 0) AS is_acquired,
+        COALESCE(p.risk_category, 'LOW') AS risk_category,
+        COALESCE(p.risk_score, 0) AS risk_score,
+        COALESCE(p.delay_probability, 0) AS delay_probability,
+        p.latitude,
+        p.longitude,
+        ST_AsGeoJSON(p.geom) AS geometry,
+        COALESCE(fa.status, 'Pending Verification') AS verification_status,
+        fa.officer_email AS assigned_officer,
+        fa.id AS assignment_id
+    FROM parcels p
+    LEFT JOIN field_assignments fa ON fa.parcel_id = p.id
+    WHERE {where_clause}
+    ORDER BY p.id DESC
+    LIMIT ? OFFSET ?
+    """
+    
+    count_sql = f"""
+    SELECT COUNT(1) AS total_count
+    FROM parcels p
+    LEFT JOIN field_assignments fa ON fa.parcel_id = p.id
+    WHERE {where_clause}
+    """
+
+    c = conn()
+    total_count = c.execute(count_sql, filtered_args).fetchone()["total_count"]
+    stats = _get_parcel_stats_dict(c, base_conditions, base_args)
+    
+    query_args = filtered_args + [min(max(limit, 1), 1000), max(offset, 0)]
+    rows = []
+    for r in c.execute(sql, query_args).fetchall():
+        d = dict(r)
+        if d.get("geometry") and isinstance(d["geometry"], str):
+            try: d["geometry"] = json.loads(d["geometry"])
+            except: pass
+        rows.append(d)
+    c.close()
+
+    role = u.get("role", "")
+    user_district = u.get("district")
+    user_taluk = u.get("taluk")
+
+    return {
+        "items": rows,
+        "count": len(rows),
+        "total": total_count,
+        "limit": limit,
+        "offset": offset,
+        "stats": stats,
+        "scope": {
+            "role": role,
+            "district": user_district if role == "district_authority" else district or "All",
+            "taluk": user_taluk if role == "field_officer" else taluk or "All"
+        }
+    }
+
+
+@router.get("/stats")
+def get_parcel_stats(
+    authorization: str = Header(None),
+    q: str = "",
+    survey_no: str = "",
+    subdivision: str = "",
+    village: str = "",
+    taluk: str = "",
+    district: str = "",
+    project_id: str = "",
+    assigned_to_me: bool = False
+):
+    u = current_user(authorization)
+    if not u: raise HTTPException(401, "Authentication required")
+
+    base_conditions, base_args = _build_base_parcel_conditions(
+        u=u, q=q, survey_no=survey_no, subdivision=subdivision,
+        village=village, taluk=taluk, district=district, project_id=project_id,
+        assigned_to_me=assigned_to_me
+    )
+    c = conn()
+    stats = _get_parcel_stats_dict(c, base_conditions, base_args)
+    c.close()
+    return {
+        "stats": stats,
+        **stats
+    }
+
+
 @router.get("/{parcel_id}")
 def get_parcel(parcel_id:int,authorization:str=Header(None)):
  if not current_user(authorization): raise HTTPException(401,"Authentication required")

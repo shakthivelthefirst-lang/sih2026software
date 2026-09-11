@@ -2,8 +2,48 @@ from pathlib import Path
 import sqlite3, hashlib, hmac, base64, json, time, secrets
 ROOT=Path(__file__).resolve().parents[1]; DATA=ROOT/'data'; DB=DATA/'survi.db'; MODEL_DIR=ROOT/'models'; MODEL_DIR.mkdir(exist_ok=True); UPLOADS=ROOT/'uploads'; UPLOADS.mkdir(exist_ok=True)
 AUTH_EMAIL='Tngov@cbe.ac.in'; AUTH_PASSWORD='Tngov@CBE#2026'
+def _st_as_geojson(geom):
+ if not geom: return None
+ try:
+  if isinstance(geom, str): return json.dumps(json.loads(geom))
+  elif isinstance(geom, dict): return json.dumps(geom)
+ except: pass
+ return None
+
+def _st_centroid(geom):
+ if not geom: return None
+ try:
+  g = json.loads(geom) if isinstance(geom, str) else geom
+  if isinstance(g, dict) and g.get('type') == 'Point': return json.dumps(g.get('coordinates'))
+  elif isinstance(g, dict) and g.get('type') in ('Polygon', 'MultiPolygon'):
+   coords = g.get('coordinates', [[]])[0]
+   if coords:
+    ring = coords[:-1] if len(coords) > 1 and coords[0] == coords[-1] else coords
+    return json.dumps([sum(pt[0] for pt in ring)/len(ring), sum(pt[1] for pt in ring)/len(ring)])
+ except: pass
+ return None
+
+def _st_x(centroid):
+ if not centroid: return None
+ try:
+  c = json.loads(centroid) if isinstance(centroid, str) else centroid
+  return float(c[0])
+ except: return None
+
+def _st_y(centroid):
+ if not centroid: return None
+ try:
+  c = json.loads(centroid) if isinstance(centroid, str) else centroid
+  return float(c[1])
+ except: return None
+
 def conn():
- c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
+ c=sqlite3.connect(DB); c.row_factory=sqlite3.Row
+ c.create_function('ST_AsGeoJSON', 1, _st_as_geojson)
+ c.create_function('ST_Centroid', 1, _st_centroid)
+ c.create_function('ST_X', 1, _st_x)
+ c.create_function('ST_Y', 1, _st_y)
+ return c
 def hash_password(p):
  salt=secrets.token_bytes(16); dk=hashlib.pbkdf2_hmac('sha256',p.encode(),salt,120000); return base64.b64encode(salt+dk).decode()
 def verify(p,stored):
@@ -20,7 +60,14 @@ def current_user(authorization):
   if not hmac.compare_digest(sig,expected): return None
   p=json.loads(base64.urlsafe_b64decode(raw+'==='));
   if p['exp']<time.time(): return None
-  c=conn(); u=c.execute('SELECT * FROM users WHERE lower(email)=lower(?) AND active=1',(p['email'],)).fetchone(); c.close(); return dict(u) if u else None
+  c=conn(); u=c.execute('SELECT * FROM users WHERE lower(email)=lower(?) AND active=1',(p['email'],)).fetchone(); c.close()
+  if not u: return None
+  ud=dict(u)
+  if not ud.get("district") and "cbe" in ud.get("email","").lower() and ud.get("role") != "state_authority":
+   ud["district"]="Coimbatore"
+  if not ud.get("taluk") and ud.get("role")=="field_officer":
+   ud["taluk"]="Sulur"
+  return ud
  except: return None
 def audit(user,action,target,details=''):
  c=conn(); c.execute('INSERT INTO audit(user_email,action,target,details) VALUES(?,?,?,?)',(user,action,target,details)); c.commit(); c.close()
@@ -40,6 +87,16 @@ CREATE TABLE IF NOT EXISTS workflow(project_id TEXT,stage TEXT,status TEXT,notes
   if csv.exists() and c.execute('SELECT count(*) n FROM projects').fetchone()['n']==0:
    df=pd.read_csv(csv).fillna('')
    for _,r in df.iterrows(): c.execute('INSERT OR IGNORE INTO projects VALUES(?,?,?,?,?,?,?,?,?,?)',tuple(r.get(k,'') for k in ['project_id','project_name','project_type','district','taluk','total_land_required','affected_parcels','affected_families','project_start_date','expected_completion_date']))
+ except Exception: pass
+ try:
+  cols = set(r['name'] for r in c.execute('PRAGMA table_info(users)').fetchall())
+  for col, ctype in [('district','TEXT'),('taluk','TEXT')]:
+   if col not in cols: c.execute(f'ALTER TABLE users ADD COLUMN {col} {ctype}')
+ except Exception: pass
+ try:
+  cols = set(r['name'] for r in c.execute('PRAGMA table_info(parcels)').fetchall())
+  for col, ctype in [('geom','TEXT'),('geometry','TEXT'),('survey_number','TEXT'),('locality','TEXT'),('revenue_village','TEXT'),('stage','TEXT'),('is_acquired','INTEGER'),('owner_name','TEXT')]:
+   if col not in cols: c.execute(f'ALTER TABLE parcels ADD COLUMN {col} {ctype}')
  except Exception: pass
  c.commit(); c.close()
 init_db()

@@ -21,23 +21,86 @@ def assign(p:dict,authorization:str=Header(None)):
  district_users=c.execute("SELECT email FROM users WHERE role='district_authority' AND active=1 ORDER BY id").fetchall(); district_email=next((r["email"] for r in district_users if (parcel["district"] or "").lower() in r["email"].lower()), district_users[0]["email"] if district_users else None)
  aid="ALT-"+uuid.uuid4().hex[:10].upper(); message=f"Parcel {parcel['id']} ({parcel['survey_no']}) assigned for field verification."; c.execute("INSERT INTO alerts(alert_id,project_id,parcel_id,type,severity,trigger,message,recommended_action,assigned_to,status) VALUES(?,?,?,?,?,?,?,?,?,?)",(aid,parcel["project_id"],parcel["id"],"New Parcels Assigned for Verification","INFO","District Officer",message,"Complete field verification",officer["email"],"Open")); c.commit(); c.close(); audit(u["email"],"ASSIGN_FIELD_PARCEL","parcel",p["parcel_id"],new_value=officer["email"]); return {"message":"Field officer assignment completed","parcel_id":parcel["id"],"project_id":parcel["project_id"],"officer_email":officer["email"],"assignment_status":"Pending Verification","alert_id":aid,"district_officer":district_email}
 @router.get("/assigned")
-def assigned(authorization:str=Header(None)):
- u=current_user(authorization)
- if not u or u["role"] not in ("field_officer","authority","admin"): raise HTTPException(403,"Field officer access required")
- c=conn(); rows=[dict(x) for x in c.execute("""
+@router.get("/verification")
+@router.get("/")
+def assigned(authorization: str = Header(None), q: str = "", status: str = "", village: str = "", taluk: str = "", limit: int = 200, offset: int = 0):
+ u = current_user(authorization)
+ if not u or u["role"] not in ("field_officer", "district_authority", "state_authority", "authority", "admin"):
+  raise HTTPException(403, "Field operations access required")
+ 
+ conditions = ["1=1"]
+ args = []
+
+ role = u.get("role")
+ user_district = u.get("district") or "Coimbatore"
+ user_taluk = u.get("taluk") or "Sulur"
+
+ if role == "field_officer":
+  conditions.append("(a.officer_email = ? OR LOWER(p.taluk) = LOWER(?) OR LOWER(p.village) = LOWER(?))")
+  args.extend([u["email"], user_taluk, user_taluk])
+ elif role == "district_authority":
+  conditions.append("LOWER(p.district) = LOWER(?)")
+  args.append(user_district)
+ 
+ if q and q.strip():
+  term = f"%{q.strip()}%"
+  conditions.append("""(
+   p.survey_no LIKE ? OR
+   p.survey_number LIKE ? OR
+   p.record_id LIKE ? OR
+   CAST(p.id AS TEXT) LIKE ? OR
+   p.owner_name LIKE ? OR
+   p.owner_reference LIKE ? OR
+   p.project_id LIKE ? OR
+   p.village LIKE ? OR
+   p.taluk LIKE ?
+  )""")
+  args.extend([term, term, term, term, term, term, term, term, term])
+
+ if status and status.strip() and status.strip().lower() not in ("all", "all statuses"):
+  st = status.strip()
+  if st.lower() in ("pending", "pending verification", "pending inspection"):
+   conditions.append("(a.status IS NULL OR a.status = 'Pending Verification' OR a.status = 'Pending')")
+  elif st.lower() == "verified":
+   conditions.append("a.status = 'Verified'")
+  else:
+   conditions.append("UPPER(a.status) = UPPER(?)")
+   args.append(st)
+
+ if village and village.strip() and village.strip().lower() not in ("all", "all villages"):
+  conditions.append("LOWER(p.village) = LOWER(?)")
+  args.append(village.strip())
+
+ if taluk and taluk.strip() and taluk.strip().lower() not in ("all", "all taluks"):
+  conditions.append("LOWER(p.taluk) = LOWER(?)")
+  args.append(taluk.strip())
+
+ where_clause = " AND ".join(conditions)
+
+ c = conn()
+ sql = f"""
   SELECT a.id AS assignment_id, a.parcel_id AS parcel_id, a.officer_email,
-         a.assigned_by, a.status AS assignment_status, a.created_at AS assigned_at,
-         p.record_id, p.survey_no, p.subdivision, p.village, p.taluk, p.district,
-         p.project_id, p.acquisition_status, v.id AS verification_id,
-         v.status AS verification_status, v.created_at AS verified_at
-  FROM field_assignments a
-  JOIN parcels p ON p.id=a.parcel_id
-  LEFT JOIN field_verifications v ON v.id=(
-   SELECT MAX(id) FROM field_verifications WHERE parcel_id=a.parcel_id AND officer_email=a.officer_email
+         a.assigned_by, COALESCE(a.status, 'Pending Verification') AS assignment_status, a.created_at AS assigned_at,
+         p.record_id, COALESCE(p.survey_number, p.survey_no) AS survey_no, p.subdivision,
+         COALESCE(p.locality, p.revenue_village, p.village) AS specific_area,
+         p.village, p.taluk, p.district, p.area, p.area_unit,
+         p.project_id, COALESCE(p.stage, p.acquisition_status) AS acquisition_status,
+         COALESCE(p.owner_name, p.owner_reference, 'Unknown') AS owner_name,
+         p.latitude, p.longitude,
+         v.id AS verification_id,
+         COALESCE(v.status, a.status, 'Pending') AS verification_status, v.created_at AS verified_at
+  FROM parcels p
+  LEFT JOIN field_assignments a ON a.parcel_id = p.id
+  LEFT JOIN field_verifications v ON v.id = (
+   SELECT MAX(id) FROM field_verifications WHERE parcel_id = p.id
   )
-  WHERE a.officer_email=? OR ? IN ('authority','admin')
-  ORDER BY a.id DESC
- """,(u["email"],u["role"])).fetchall()]; c.close(); return rows
+  WHERE {where_clause}
+  ORDER BY a.id DESC, p.id DESC
+  LIMIT ? OFFSET ?
+ """
+ rows = [dict(x) for x in c.execute(sql, args + [min(max(limit, 1), 1000), max(offset, 0)]).fetchall()]
+ c.close()
+ return rows
 @router.post("/{parcel_id}/verify")
 def verify(parcel_id:int,p:dict,authorization:str=Header(None)):
  u=current_user(authorization)

@@ -1,11 +1,13 @@
-import React, { useEffect, useState } from "react";
-import { MapContainer, TileLayer, Marker, Popup, Circle, Polygon } from "react-leaflet";
+import React, { useEffect, useState, useMemo } from "react";
+import { MapContainer, TileLayer, Marker, Popup, Circle, Polygon, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 import icon from "leaflet/dist/images/marker-icon.png";
 import iconShadow from "leaflet/dist/images/marker-shadow.png";
 import iconRetina from "leaflet/dist/images/marker-icon-2x.png";
 import DocumentsPage from "./DocumentsPage";
+import ProjectAcquisitionMap, { isParcelAcquired, createSquareIcon } from "./ProjectAcquisitionMap";
+import LandParcels from "./LandParcels";
 
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
@@ -217,6 +219,20 @@ function DistrictDashboard({ go, user }) {
   const { data: d, error: dashboardError } = useData("/dashboard/district", 5000);
   const { data: alertsList, error: alertsError } = useData("/alerts/?status=Open", 5000);
   const { data: projectList, error: projectsError } = useData("/projects/?limit=500", 5000);
+
+  const [parcelQuery, setParcelQuery] = useState("");
+  const [debouncedParcelQ, setDebouncedParcelQ] = useState("");
+  const [talukFilter, setTalukFilter] = useState("All");
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedParcelQ(parcelQuery), 300);
+    return () => clearTimeout(timer);
+  }, [parcelQuery]);
+
+  const parcelUrl = `/api/parcels?district=${encodeURIComponent(user?.district || "Coimbatore")}&limit=50` + 
+    (debouncedParcelQ ? `&q=${encodeURIComponent(debouncedParcelQ)}` : "") +
+    (talukFilter !== "All" ? `&taluk=${encodeURIComponent(talukFilter)}` : "");
+  const { data: districtParcels } = useData(parcelUrl, 5000);
   
   if (dashboardError) return <Panel title="District Authority Dashboard"><div className="error">Unable to load district dashboard ({dashboardError.status || "network error"}): {dashboardError.message}</div></Panel>;
   if (!d) return <Panel title="District Authority Dashboard">Loading…</Panel>;
@@ -241,6 +257,53 @@ function DistrictDashboard({ go, user }) {
           ))}
         </Panel>
       )}
+
+      {/* District Parcel Search & Register Bar */}
+      <Panel title="District Parcel Search & Register">
+        <div className="toolbar" style={{ display: "flex", gap: "10px", alignItems: "center", marginBottom: "14px", flexWrap: "wrap" }}>
+          <div style={{ position: "relative", flex: "1 1 280px", minWidth: "220px" }}>
+            <input
+              placeholder="Search district parcels by Survey No, Parcel ID, Owner, Taluk..."
+              value={parcelQuery}
+              onChange={e => setParcelQuery(e.target.value)}
+              style={{ width: "100%", margin: 0, padding: "8px 32px 8px 12px", boxSizing: "border-box" }}
+            />
+            {parcelQuery && (
+              <button
+                type="button"
+                onClick={() => { setParcelQuery(""); setDebouncedParcelQ(""); }}
+                style={{ position: "absolute", right: "8px", top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: "#94a3b8", cursor: "pointer", fontSize: "14px" }}
+                title="Clear search"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+          <select
+            value={talukFilter}
+            onChange={e => setTalukFilter(e.target.value)}
+            style={{ margin: 0, padding: "8px 12px" }}
+          >
+            <option value="All">All Taluks</option>
+            {["Sulur", "Kinathukadavu", "Annur", "Perur", "Mettupalayam", "Madukkarai"].map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+          <span className="project-count-badge">
+            District: {user?.district || "Coimbatore"} 🔒
+          </span>
+          <span className="project-count-badge">
+            Showing {districtParcels?.items?.length || 0} of {districtParcels?.total || 0} parcels
+          </span>
+        </div>
+        {districtParcels?.items?.length ? (
+          <Table
+            rows={districtParcels.items.slice(0, 15)}
+            cols={["id", "survey_no", "village", "taluk", "district", "owner_name", "area", "project_id", "acquisition_status"]}
+            onClick={go}
+          />
+        ) : (
+          <p>No district parcels found matching your search.</p>
+        )}
+      </Panel>
 
       <Panel title="District Project List">
         {projectsError && <div className="error">Unable to load projects ({projectsError.status || "network error"}): {projectsError.message}</div>}
@@ -331,14 +394,224 @@ function ActionButton({ label, onClick, disabled }) {
 
 function Projects({ go }) {
   const { data: d, error } = useData("/projects/?limit=500", 5000);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [selectedType, setSelectedType] = useState("");
+  const [selectedTaluk, setSelectedTaluk] = useState("");
+  const [selectedStage, setSelectedStage] = useState("");
+
+  // Unique taluks dynamically populated from project items
+  const talukOptions = useMemo(() => {
+    const set = new Set();
+    (d?.items || []).forEach(p => {
+      const t = String(p.taluk || "").trim();
+      if (t) set.add(t);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [d?.items]);
+
+  // Project type options: required types + any other types from data
+  const projectTypeOptions = useMemo(() => {
+    const requiredTypes = ["Rail", "Road", "Airport", "Industrial", "Urban Development"];
+    const set = new Set(requiredTypes);
+    (d?.items || []).forEach(p => {
+      const t = String(p.project_type || "").trim();
+      if (t) set.add(t);
+    });
+    return Array.from(set);
+  }, [d?.items]);
+
+  // Status / Stage filter options
+  const stageOptions = [
+    "Proposal",
+    "SIA / Survey",
+    "Approval",
+    "Rehabilitation",
+    "Closure / Completion"
+  ];
+
+  // Real-time filtering across search input and dropdowns
+  const filteredProjects = useMemo(() => {
+    if (!d?.items) return [];
+    return d.items.filter(p => {
+      // 1. Search Bar (case-insensitive across Project ID, Name, Taluk)
+      if (searchQuery.trim()) {
+        const q = searchQuery.trim().toLowerCase();
+        const pId = String(p.project_id || "").toLowerCase();
+        const pName = String(p.project_name || "").toLowerCase();
+        const pTaluk = String(p.taluk || "").toLowerCase();
+        if (!pId.includes(q) && !pName.includes(q) && !pTaluk.includes(q)) {
+          return false;
+        }
+      }
+
+      // 2. Project Type Filter
+      if (selectedType) {
+        const pType = String(p.project_type || "").trim().toLowerCase();
+        const targetType = selectedType.trim().toLowerCase();
+        if (targetType === "industrial") {
+          if (!pType.includes("industrial")) return false;
+        } else if (pType !== targetType) {
+          return false;
+        }
+      }
+
+      // 3. Taluk Filter
+      if (selectedTaluk) {
+        const pTaluk = String(p.taluk || "").trim().toLowerCase();
+        if (pTaluk !== selectedTaluk.trim().toLowerCase()) return false;
+      }
+
+      // 4. Status / Stage Filter
+      if (selectedStage) {
+        const targetStage = selectedStage.trim().toLowerCase();
+        const currentStage = String(p.current_stage || "").trim().toLowerCase();
+        const status = String(p.project_status || "").trim().toLowerCase();
+
+        let matches = false;
+        if (targetStage === "sia / survey") {
+          matches = currentStage === "sia / survey" || currentStage === "survey";
+        } else if (targetStage === "rehabilitation") {
+          matches = currentStage === "rehabilitation" || currentStage.includes("rehabilitation");
+        } else if (targetStage === "closure / completion") {
+          matches = currentStage === "closure / completion" || currentStage === "completed" || status === "completed";
+        } else {
+          matches = currentStage === targetStage || status === targetStage;
+        }
+        if (!matches) return false;
+      }
+
+      return true;
+    });
+  }, [d?.items, searchQuery, selectedType, selectedTaluk, selectedStage]);
+
+  const handleResetFilters = () => {
+    setSearchQuery("");
+    setSelectedType("");
+    setSelectedTaluk("");
+    setSelectedStage("");
+  };
+
+  const isFiltered = Boolean(searchQuery.trim() || selectedType || selectedTaluk || selectedStage);
+  const totalCount = d?.items?.length || 0;
+  const filteredCount = filteredProjects.length;
+
   if (error) return <Panel title="Project Register"><div className="error">Unable to load projects ({error.status || "network error"}): {error.message}</div></Panel>;
   if (!d) return <Panel title="Project Register">Loading projects...</Panel>;
+
   return (
     <Panel title="Project Register">
-      <Table rows={d.items || []} cols={["project_id", "project_name", "project_type", "district", "taluk", "current_stage", "project_status", "progress"]} onClick={go} />
+      {/* Search and Filter Toolbar */}
+      <div className="project-toolbar">
+        <div className="project-toolbar-filters">
+          {/* Search Bar with Clear (✕) Button */}
+          <div className="search-input-wrapper">
+            <input
+              type="text"
+              placeholder="Search by Project ID, Name, or Taluk..."
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              aria-label="Search by Project ID, Name, or Taluk"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                className="search-clear-btn"
+                onClick={() => setSearchQuery("")}
+                aria-label="Clear search"
+                title="Clear search"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+
+          {/* Project Type Filter Dropdown */}
+          <select
+            className="project-filter-select"
+            value={selectedType}
+            onChange={e => setSelectedType(e.target.value)}
+            aria-label="Filter by Project Type"
+          >
+            <option value="">All Types</option>
+            {projectTypeOptions.map(t => (
+              <option key={t} value={t}>{t}</option>
+            ))}
+          </select>
+
+          {/* Taluk Filter Dropdown (Dynamically Populated) */}
+          <select
+            className="project-filter-select"
+            value={selectedTaluk}
+            onChange={e => setSelectedTaluk(e.target.value)}
+            aria-label="Filter by Taluk"
+          >
+            <option value="">All Taluks</option>
+            {talukOptions.map(t => (
+              <option key={t} value={t}>{t}</option>
+            ))}
+          </select>
+
+          {/* Status / Stage Filter Dropdown */}
+          <select
+            className="project-filter-select"
+            value={selectedStage}
+            onChange={e => setSelectedStage(e.target.value)}
+            aria-label="Filter by Stage or Status"
+          >
+            <option value="">All Stages</option>
+            {stageOptions.map(s => (
+              <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
+
+          {/* Reset Filters button if any filter is active */}
+          {isFiltered && (
+            <button
+              type="button"
+              className="btn-reset-filters"
+              onClick={handleResetFilters}
+              title="Reset all filters"
+            >
+              Reset Filters
+            </button>
+          )}
+        </div>
+
+        {/* Live Count Badge */}
+        <div className="project-count-badge" aria-live="polite">
+          Showing {filteredCount} of {totalCount} projects
+        </div>
+      </div>
+
+      {/* Results Table or Clean Empty State */}
+      {filteredCount === 0 ? (
+        <div className="project-empty-state">
+          <div className="empty-title">
+            No projects found matching your search.
+          </div>
+          <p className="empty-subtitle">
+            Try adjusting keywords or filters.
+          </p>
+          <button
+            type="button"
+            className="btn-reset-filters primary"
+            onClick={handleResetFilters}
+          >
+            Reset Filters
+          </button>
+        </div>
+      ) : (
+        <Table
+          rows={filteredProjects}
+          cols={["project_id", "project_name", "project_type", "district", "taluk", "current_stage", "project_status", "progress"]}
+          onClick={go}
+        />
+      )}
     </Panel>
   );
 }
+
+// ProjectAcquisitionMap is imported from ./ProjectAcquisitionMap
 
 function Workflow({ selected, go, user }) {
   const { data: projectDetails, error } = useData(selected ? `/projects/${selected.project_id}` : null, 5000);
@@ -408,6 +681,7 @@ function Workflow({ selected, go, user }) {
         {projectDetails.pending_verification_count > 0 && <div className="notice">{projectDetails.pending_verification_count} linked parcel(s) are still pending field verification.</div>}
         {canExecute && nextStage && <ActionButton label={`Move to ${nextStage.label}`} onClick={transition} />}
       </Panel>
+      <ProjectAcquisitionMap projectId={projectDetails.project_id} />
       {canExecute && <Panel title="Link Existing Parcel">
         <form className="toolbar" onSubmit={search}><input placeholder="Survey / Survey-Subdivision (e.g. 00029/4A)" value={survey} onChange={e => setSurvey(e.target.value)} /><input placeholder="Subdivision" value={subdivision} onChange={e => setSubdivision(e.target.value)} /><input placeholder="Village" value={village} onChange={e => setVillage(e.target.value)} /><input placeholder="Taluk" value={taluk} onChange={e => setTaluk(e.target.value)} /><input placeholder="District" value={district} onChange={e => setDistrict(e.target.value)} /><button type="submit">Search Parcels</button></form>
         {searchError && <div className="error">Unable to search parcels: {searchError.message}</div>}
@@ -697,19 +971,78 @@ function Reports() {
 }
 
 function FieldVerification({ go }) {
-  const { data: d, error } = useData("/field/assigned");
+  const [searchTerm, setSearchTerm] = useState("");
+  const [debouncedQ, setDebouncedQ] = useState("");
+  const [statusFilter, setStatusFilter] = useState("All");
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedQ(searchTerm), 300);
+    return () => clearTimeout(timer);
+  }, [searchTerm]);
+
+  const queryUrl = `/api/field-verification?q=${encodeURIComponent(debouncedQ)}&status=${encodeURIComponent(statusFilter)}`;
+  const { data: d, error } = useData(queryUrl, 5000);
+
   if (error) return <Panel title="Field Verification Worklist"><div className="error">Unable to load field assignments ({error.status || "network error"}): {error.message} <RefreshButton /></div></Panel>;
   if (!d) return <Panel title="Field Verification Worklist"><p>Loading field assignments...</p></Panel>;
+
   return (
     <Panel title="Field Verification Worklist">
-      <Table rows={d} cols={["assignment_id", "parcel_id", "survey_no", "subdivision", "village", "taluk", "project_id", "assignment_status", "assigned_at"]} actions={(r) => (
-        <div style={{display: "flex", gap: "5px"}}>
-          {r.assignment_status !== "Verified" ? 
-            <ActionButton label="Mark Verified" onClick={async () => { await api(`/field/assignments/${r.assignment_id}/verify`, { method: "POST", body: JSON.stringify({ remarks: "Verified OK" }) }); }} /> 
-          : <span style={{color: "green", marginRight: "10px"}}>Verified</span>}
-          <button type="button" onClick={() => go({ project_id: r.project_id, parcel_id: r.parcel_id })}>Upload / OCR</button>
+      <div className="toolbar" style={{ display: "flex", gap: "10px", alignItems: "center", marginBottom: "14px", flexWrap: "wrap" }}>
+        <div style={{ position: "relative", flex: "1 1 280px", minWidth: "220px" }}>
+          <input
+            placeholder="Search assigned parcels by Survey No, Parcel ID, Village, Taluk..."
+            value={searchTerm}
+            onChange={e => setSearchTerm(e.target.value)}
+            style={{ width: "100%", margin: 0, padding: "8px 32px 8px 12px", boxSizing: "border-box" }}
+          />
+          {searchTerm && (
+            <button
+              type="button"
+              onClick={() => { setSearchTerm(""); setDebouncedQ(""); }}
+              style={{ position: "absolute", right: "8px", top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: "#94a3b8", cursor: "pointer", fontSize: "14px" }}
+              title="Clear search"
+            >
+              ✕
+            </button>
+          )}
         </div>
-      )}/>
+        <select
+          value={statusFilter}
+          onChange={e => setStatusFilter(e.target.value)}
+          style={{ margin: 0, padding: "8px 12px", minWidth: "150px" }}
+        >
+          <option value="All">All Statuses</option>
+          <option value="Pending Verification">Pending Verification</option>
+          <option value="Verified">Verified</option>
+        </select>
+        <span className="project-count-badge">
+          Showing {d.length} parcels
+        </span>
+      </div>
+
+      {d.length === 0 ? (
+        <div style={{ padding: "30px 20px", textAlign: "center", background: "#f8fafc", borderRadius: "8px", border: "1px dashed #cbd5e1" }}>
+          No field assignments found matching your search.
+          <br />
+          <button
+            type="button"
+            onClick={() => { setSearchTerm(""); setDebouncedQ(""); setStatusFilter("All"); }}
+            style={{ marginTop: "10px", padding: "6px 14px", background: "#0f6c70", color: "#fff", border: "none", borderRadius: "6px", cursor: "pointer", fontSize: "12px", fontWeight: "600" }}
+          >
+            Reset Search
+          </button>
+        </div>
+      ) : (
+        <Table rows={d} cols={["assignment_id", "parcel_id", "survey_no", "subdivision", "village", "taluk", "project_id", "assignment_status", "assigned_at"]} actions={(r) => (
+          <div style={{display: "flex", gap: "5px"}}>
+            {r.assignment_status !== "Verified" ? 
+              <ActionButton label="Mark Verified" onClick={async () => { await api(`/field/assignments/${r.assignment_id}/verify`, { method: "POST", body: JSON.stringify({ remarks: "Verified OK" }) }); }} /> 
+            : <span style={{color: "green", marginRight: "10px"}}>Verified</span>}
+            <button type="button" onClick={() => go({ project_id: r.project_id, parcel_id: r.parcel_id })}>Upload / OCR</button>
+          </div>
+        )}/>
+      )}
     </Panel>
   );
 }
@@ -1236,7 +1569,7 @@ function App() {
   else if (page === "state_dashboard") content = <StateDashboard />;
   else if (page === "district_dashboard") content = <DistrictDashboard user={user} go={x => { setSelected(x); setPage("workflow"); }} />;
   else if (page === "projects") content = <Projects go={x => { setSelected(x); setPage("workflow"); }} />;
-  else if (page === "parcels") content = <Parcels go={x => { setSelected(x); setPage("workflow"); }} />;
+  else if (page === "parcels") content = <LandParcels user={user} go={x => { setSelected(x); setPage("workflow"); }} />;
   else if (page === "gis") content = <GIS />;
   else if (page === "ml") content = <ML />;
   else if (page === "citizen_dash") content = <CitizenDash lang={lang} user={user} />;
@@ -1263,11 +1596,15 @@ function App() {
 
   return (
     <div className="shell">
-      <aside>
-        <div className="logo">LAND<span>NEXUS</span></div>
-        <div className="tag">SIH 26016 CORE</div>
-        {allowedNav.map(n => <button className={page === n[0] ? "nav active" : "nav"} key={n[0]} onClick={() => setPage(n[0])}>{lang === "ta" ? tamil[n[1]] || n[1] : n[1]}</button>)}
-        <div className="side-bottom">
+      <aside className="sidebar flex flex-col h-screen max-h-screen">
+        <div className="side-header shrink-0 flex-shrink-0">
+          <div className="logo">LAND<span>NEXUS</span></div>
+          <div className="tag">SIH 26016 CORE</div>
+        </div>
+        <div className="side-nav-scroll flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
+          {allowedNav.map(n => <button className={page === n[0] ? "nav active" : "nav"} key={n[0]} onClick={() => setPage(n[0])}>{lang === "ta" ? tamil[n[1]] || n[1] : n[1]}</button>)}
+        </div>
+        <div className="side-bottom shrink-0 flex-shrink-0">
           <button className="nav" onClick={() => setLang(lang === "en" ? "ta" : "en")}>English / தமிழ்</button>
           <button className="nav logout" onClick={() => { localStorage.removeItem("survi_token"); setUser(null); }}>Logout</button>
         </div>

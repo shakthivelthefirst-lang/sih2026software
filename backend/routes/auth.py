@@ -9,12 +9,15 @@ class UserIn(BaseModel): email:str; password:str; role:str
 def login(x:Login):
  c=conn(); u=c.execute("SELECT * FROM users WHERE lower(email)=lower(?) AND active=1",(x.email,)).fetchone(); c.close()
  if not u or not verify(x.password,u["password_hash"]): raise HTTPException(401,"Invalid credentials")
- return {"access_token":token(u["email"],u["role"]),"token_type":"bearer","user":{"email":u["email"],"role":u["role"],"is_authority":bool(u["is_authority"])}}
+ ud=dict(u)
+ district=ud.get("district") or ("Coimbatore" if "cbe" in ud["email"].lower() and ud["role"]!="state_authority" else None)
+ taluk=ud.get("taluk") or ("Sulur" if ud["role"]=="field_officer" else None)
+ return {"access_token":token(u["email"],u["role"]),"token_type":"bearer","user":{"email":u["email"],"role":u["role"],"is_authority":bool(u["is_authority"]),"district":district,"taluk":taluk}}
 @router.get("/me")
 def me(authorization:str=Header(None)):
  u=current_user(authorization)
  if not u: raise HTTPException(401,"Authentication required")
- return {"email":u["email"],"role":u["role"],"is_authority":bool(u["is_authority"])}
+ return {"email":u["email"],"role":u["role"],"is_authority":bool(u.get("is_authority")),"district":u.get("district"),"taluk":u.get("taluk")}
 @router.get("/users")
 def users(authorization:str=Header(None)):
  u=current_user(authorization)
